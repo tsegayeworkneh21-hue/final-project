@@ -197,7 +197,7 @@ def page_predict(model) -> None:
             with columns[i % 2]:
                 choice = st.selectbox(feature.label, list(feature.options), help=feature.help, key=feature.code)
                 answers[feature.code] = feature.options[choice]
-        submitted = st.form_submit_button("Predict satisfaction", type="primary")
+        submitted = st.form_submit_button("▶  Predict Satisfaction", type="primary",use_container_width=True)
 
     if not submitted:
         return
