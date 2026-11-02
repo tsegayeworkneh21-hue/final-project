@@ -1,770 +1,395 @@
 """
-app.py  –  Maternal Satisfaction Predictor
-==========================================
-Study     : Maternal satisfaction among vaginal and caesarean section
-            delivery care services in Bahir Dar City Health Facilities,
-            Northwest Ethiopia: Application of Machine Learning
+Maternal Satisfaction Predictor
+===============================
+Maternal satisfaction among vaginal and caesarean section delivery care services in
+Bahir Dar City Health Facilities, Northwest Ethiopia: application of machine learning.
 
-Model     : Logistic Regression  (C=0.1 | class_weight='balanced' | lbfgs)
-            Tuned via 5-fold Stratified GridSearchCV (ROC-AUC scoring)
-Model file: Maternal_Satisfaction_LR_Final_Model.pkl
+Model file : Maternal_Satisfaction_LR_Final_Model.pkl  (saved in Step 12 of the notebook)
+Run        : streamlit run app.py
 
-Optimal threshold : 0.65  (Youden J statistic, held-out test set, n=179)
-  Sensitivity = 88.2%  |  Specificity = 81.2%
-  Precision   = 88.2%  |  Recall      = 88.2%
-  F1 Score    = 88.2%  |  Accuracy    = 85.5%
-
-Run:  streamlit run app.py
+Everything that comes from the notebook (metrics, threshold table, study counts) is kept in
+the "Reported results" block below. After re-running the notebook, update only that block.
 """
 
-import joblib
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Configuration
+# =============================================================================
+MODEL_PATH = Path(__file__).parent / "Maternal_Satisfaction_LR_Final_Model.pkl"
+THRESHOLD = 0.65  # decision threshold for "satisfied" (Youden J on the test set)
+
+NAVY, BLUE, GREEN, AMBER, RED = "#0F3460", "#3A6EA5", "#2E8B57", "#C98A00", "#C0392B"
+
 st.set_page_config(
     page_title="Maternal Satisfaction Predictor",
-    page_icon="🤰",
+    page_icon="🤱",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH        = Path(__file__).parent / "Maternal_Satisfaction_LR_Final_Model.pkl"
-OPTIMAL_THRESHOLD = 0.65   # Youden J – do NOT change without re-running analysis
+# =============================================================================
+# Reported results (copied from the notebook output)
+# =============================================================================
+STUDY = {"n_total": 894, "n_test": 179, "n_not_satisfied": 345, "n_satisfied": 549, "n_candidates": 27}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom CSS
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
+# Confusion matrix on the test set at THRESHOLD
+TN, FP, FN, TP = 56, 13, 13, 97
+
+# Not computed from the model, so update by hand after re-running the notebook.
+AUC_ROC = 0.92  # approximate
+BRIER = 0.1204
+
+THRESHOLD_TABLE = pd.DataFrame({
+    "Threshold":   [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+    "Sensitivity": [0.991, 0.991, 0.991, 0.973, 0.973, 0.964, 0.891, 0.882, 0.791, 0.664, 0.627],
+    "Specificity": [0.435, 0.464, 0.464, 0.522, 0.609, 0.638, 0.783, 0.812, 0.884, 0.913, 0.913],
+    "F1 score":    [0.845, 0.852, 0.852, 0.856, 0.877, 0.880, 0.879, 0.882, 0.849, 0.772, 0.746],
+    "Accuracy":    [0.777, 0.788, 0.788, 0.799, 0.832, 0.838, 0.849, 0.855, 0.827, 0.760, 0.737],
+    "Youden J":    [0.426, 0.455, 0.455, 0.494, 0.581, 0.601, 0.674, 0.693, 0.675, 0.577, 0.540],
+})
+
+# Metrics derived from the confusion matrix, so they always agree with it.
+N = TN + FP + FN + TP
+METRICS = {
+    "Accuracy": (TP + TN) / N,
+    "Sensitivity": TP / (TP + FN),
+    "Specificity": TN / (TN + FP),
+    "Precision": TP / (TP + FP),
+}
+METRICS["F1 score"] = 2 * METRICS["Precision"] * METRICS["Sensitivity"] / (
+    METRICS["Precision"] + METRICS["Sensitivity"]
+)
+
+# =============================================================================
+# Model inputs (order and SPSS codes must match the training data)
+# =============================================================================
+@dataclass(frozen=True)
+class Feature:
+    code: str
+    label: str
+    help: str
+    options: dict  # display text -> SPSS code
+
+
+FEATURES = [
+    Feature("q411owners", "Facility ownership", "Type of facility where the delivery took place.",
+            {"Private": 1.0, "Government": 2.0}),
+    Feature("q301greeti", "Greeted by the health professional", "Was the mother greeted on arrival?",
+            {"Yes": 1.0, "No": 2.0}),
+    Feature("q112waitpl", "Waiting area available", "Was there a designated waiting area?",
+            {"Yes": 1.0, "No": 2.0}),
+    Feature("q113privac", "Privacy during examination", "Was privacy maintained during the physical examination?",
+            {"Yes": 1.0, "No": 2.0}),
+    Feature("distancerecode1", "Distance to the facility", "Distance from the mother's home to the facility.",
+            {"10 km or less": 1.0, "More than 10 km": 2.0}),
+    Feature("q302respec", "Respectful care during delivery", "Was the mother treated respectfully by staff?",
+            {"Yes": 1.0, "No": 2.0}),
+    Feature("q110reason", "Reason for the visit", "Why the mother came to this facility.",
+            {"Planned": 1.0, "Referred": 2.0}),
+    Feature("q111timeta", "Time to reach the facility", "Travel time from home to the facility.",
+            {"Less than 1 hour": 1.0, "More than 1 hour": 2.0}),
+    Feature("q108reside", "Residence", "Where the mother currently lives.",
+            {"Urban": 1.0, "Rural": 2.0}),
+    Feature("q102mstatu", "Marital status", "Current marital status of the mother.",
+            {"Single": 1.0, "Married": 2.0, "Cohabited": 3.0, "Widowed": 4.0, "Divorced": 5.0}),
+]
+FEATURE_ORDER = [f.code for f in FEATURES]
+FEATURE_BY_CODE = {f.code: f for f in FEATURES}
+
+# =============================================================================
+# Styling
+# =============================================================================
+st.markdown(f"""
 <style>
-/* gradient header */
-.hero {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-    border-radius: 16px;
-    padding: 36px 40px;
-    margin-bottom: 28px;
-    color: white;
-}
-.hero h1 { font-size: 2.4em; margin: 0 0 8px 0; }
-.hero p  { font-size: 1.05em; opacity: 0.85; margin: 0; }
-
-/* feature cards */
-.feat-card {
-    background: #f8f9ff;
-    border: 1px solid #e0e4f0;
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 12px;
-    transition: box-shadow 0.2s;
-}
-.feat-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.10); }
-
-/* result box */
-.result-satisfied {
-    background: linear-gradient(135deg, #d4edda, #c3e6cb);
-    border-left: 6px solid #28a745;
-    border-radius: 12px;
-    padding: 24px 28px;
-    margin: 16px 0;
-}
-.result-not-satisfied {
-    background: linear-gradient(135deg, #fff3cd, #ffeeba);
-    border-left: 6px solid #ffc107;
-    border-radius: 12px;
-    padding: 24px 28px;
-    margin: 16px 0;
-}
-.result-satisfied h2, .result-not-satisfied h2 {
-    margin: 0 0 8px 0; font-size: 1.9em;
-}
-.result-satisfied p, .result-not-satisfied p {
-    margin: 0; font-size: 1.05em;
-}
-
-/* metric badge */
-.badge {
-    display: inline-block;
-    background: #0f3460;
-    color: white;
-    border-radius: 20px;
-    padding: 4px 14px;
-    font-size: 0.82em;
-    font-weight: 600;
-    margin: 2px;
-}
-
-/* section title */
-.section-title {
-    font-size: 1.25em;
-    font-weight: 700;
-    color: #0f3460;
-    border-bottom: 2px solid #0f3460;
-    padding-bottom: 6px;
-    margin: 24px 0 16px 0;
-}
+.hero {{ background: linear-gradient(135deg, #0B2545 0%, {NAVY} 100%); border-radius: 14px;
+         padding: 30px 36px; margin-bottom: 24px; color: #fff; }}
+.hero h1 {{ font-size: 2rem; margin: 0 0 8px 0; color: #fff; }}
+.hero p  {{ font-size: 1.02rem; margin: 0; color: #D6E2F0; max-width: 70ch; }}
+.section-title {{ font-size: 1.2rem; font-weight: 700; margin: 26px 0 12px 0;
+                  padding-bottom: 6px; border-bottom: 2px solid {BLUE}; }}
+.result {{ border-radius: 12px; padding: 22px 26px; margin: 14px 0; color: #1B2A41; }}
+.result h2 {{ margin: 0 0 6px 0; font-size: 1.6rem; color: inherit; }}
+.result p  {{ margin: 0; font-size: 1.02rem; }}
+.result.ok  {{ background: #E3F4EA; border-left: 6px solid {GREEN}; }}
+.result.low {{ background: #FBEFD5; border-left: 6px solid {AMBER}; }}
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Feature definitions  (exact order the model was trained on)
-# ─────────────────────────────────────────────────────────────────────────────
-FEATURE_ORDER = [
-    "q411owners",
-    "q301greeti",
-    "q112waitpl",
-    "q113privac",
-    "distancerecode1",
-    "q302respec",
-    "q110reason",
-    "q111timeta",
-    "q108reside",
-    "q102mstatu",
-]
 
-FEATURE_META = {
-    "q411owners": {
-        "label": "Facility Ownership",
-        "icon":  "🏥",
-        "help":  "Type of health facility where the delivery took place.",
-        "options": {"Private": 1.0, "Government": 2.0},
-    },
-    "q301greeti": {
-        "label": "Professional Greeting",
-        "icon":  "👋",
-        "help":  "Was the mother greeted by the health professional on arrival?",
-        "options": {"Yes": 1.0, "No": 2.0},
-    },
-    "q112waitpl": {
-        "label": "Waiting Area Available",
-        "icon":  "🪑",
-        "help":  "Was a designated waiting area available at the facility?",
-        "options": {"Yes": 1.0, "No": 2.0},
-    },
-    "q113privac": {
-        "label": "Privacy During Examination",
-        "icon":  "🔒",
-        "help":  "Was gender privacy maintained during physical examination?",
-        "options": {"Yes": 1.0, "No": 2.0},
-    },
-    "distancerecode1": {
-        "label": "Distance to Facility",
-        "icon":  "📍",
-        "help":  "Distance from the mother's home to the health facility.",
-        "options": {"≤ 10 km": 1.0, "> 10 km": 2.0},
-    },
-    "q302respec": {
-        "label": "Respectful Care During Delivery",
-        "icon":  "🤝",
-        "help":  "Was the mother treated respectfully by staff during delivery?",
-        "options": {"Yes": 1.0, "No": 2.0},
-    },
-    "q110reason": {
-        "label": "Reason for Hospital Visit",
-        "icon":  "📋",
-        "help":  "Why did the mother come to this facility for delivery?",
-        "options": {"Planned visit": 1.0, "Referred": 2.0},
-    },
-    "q111timeta": {
-        "label": "Time to Reach Facility",
-        "icon":  "⏱️",
-        "help":  "How long did it take the mother to travel to the facility?",
-        "options": {"Less than 1 hour": 1.0, "More than 1 hour": 2.0},
-    },
-    "q108reside": {
-        "label": "Residence",
-        "icon":  "🏘️",
-        "help":  "Where does the mother currently live?",
-        "options": {"Urban": 1.0, "Rural": 2.0},
-    },
-    "q102mstatu": {
-        "label": "Marital Status",
-        "icon":  "💍",
-        "help":  "Current marital status of the mother.",
-        "options": {
-            "Single":    1.0,
-            "Married":   2.0,
-            "Cohabited": 3.0,
-            "Widowed":   4.0,
-            "Divorced":  5.0,
-        },
-    },
-}
-
-# Model performance at threshold 0.65
-MODEL_PERF = {
-    "Accuracy":    0.8547,
-    "Precision":   0.8818,
-    "Recall":      0.8818,
-    "F1 Score":    0.8818,
-    "Sensitivity": 0.8818,
-    "Specificity": 0.8116,
-    "AUC-ROC":     0.9200,   # approximate from notebook
-    "Brier Score": 0.1204,   # lower is better (0=perfect, 0.25=random)
-}
-
-# Threshold comparison table
-THRESHOLD_TABLE = pd.DataFrame({
-    "Threshold":   [0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75,0.80],
-    "Sensitivity": [0.991,0.991,0.991,0.973,0.973,0.964,0.891,0.882,0.791,0.664,0.627],
-    "Specificity": [0.435,0.464,0.464,0.522,0.609,0.638,0.783,0.812,0.884,0.913,0.913],
-    "F1 Score":    [0.845,0.852,0.852,0.856,0.877,0.880,0.879,0.882,0.849,0.772,0.746],
-    "Accuracy":    [0.777,0.788,0.788,0.799,0.832,0.838,0.849,0.855,0.827,0.760,0.737],
-    "Youden J":    [0.426,0.455,0.455,0.494,0.581,0.601,0.674,0.693,0.675,0.577,0.540],
-})
+def hero(title: str, text: str) -> None:
+    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{text}</p></div>', unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Load model
-# ─────────────────────────────────────────────────────────────────────────────
+def section(title: str) -> None:
+    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
+
+
+# =============================================================================
+# Model helpers
+# =============================================================================
 @st.cache_resource
 def load_model(path: Path):
     return joblib.load(path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
+def check_model_inputs(model) -> None:
+    """Stop with a clear message if the saved model expects different inputs than this app sends."""
+    expected = list(model.named_steps["preprocessor"].feature_names_in_)
+    missing, extra = set(expected) - set(FEATURE_ORDER), set(FEATURE_ORDER) - set(expected)
+    if missing or extra:
+        st.error(
+            "The model file and this app use different input variables.\n\n"
+            f"- Inputs the model expects but the app does not provide: `{sorted(missing)}`\n"
+            f"- Inputs the app provides but the model does not use: `{sorted(extra)}`\n\n"
+            "Update `FEATURES` in `app.py` to match the model, or save the model again from the notebook."
+        )
+        st.stop()
+
+
+def odds_ratio_table(model) -> pd.DataFrame:
+    """Odds ratios of every encoded category, with readable names."""
+    prep, clf = model.named_steps["preprocessor"], model.named_steps["classifier"]
+    rows = []
+    for encoded, coef in zip(prep.get_feature_names_out(), clf.coef_[0]):
+        name = encoded.split("__", 1)[-1]
+        code, _, value = name.rpartition("_")
+        feature = FEATURE_BY_CODE.get(code)
+        if feature is not None:
+            option = next((k for k, v in feature.options.items() if v == float(value)), value)
+            name = f"{feature.label}: {option}"
+        rows.append({"Category": name, "Odds ratio": float(np.exp(coef))})
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# Pages
+# =============================================================================
+def page_predict(model) -> None:
+    hero("Maternal Satisfaction Predictor",
+         "Estimate whether a mother is likely to be satisfied with her delivery care, using a logistic "
+         f"regression model trained on {STUDY['n_total']} mothers from Bahir Dar City health facilities.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Decision threshold", f"{THRESHOLD:.2f}", help="Predicted satisfied when probability ≥ threshold.")
+    c2.metric("Sensitivity", f"{METRICS['Sensitivity']:.1%}")
+    c3.metric("Specificity", f"{METRICS['Specificity']:.1%}")
+    c4.metric("F1 score", f"{METRICS['F1 score']:.1%}")
+
+    section("Enter the mother's details")
+    st.caption(f"Answer all {len(FEATURES)} questions. Service-rating items were excluded from the model "
+               "because they are part of the satisfaction outcome itself.")
+
+    answers: dict[str, float] = {}
+    with st.form("predict_form"):
+        columns = st.columns(2, gap="large")
+        for i, feature in enumerate(FEATURES):
+            with columns[i % 2]:
+                choice = st.selectbox(feature.label, list(feature.options), help=feature.help, key=feature.code)
+                answers[feature.code] = feature.options[choice]
+        submitted = st.form_submit_button("▶  Predict Satisfaction", type="primary",use_container_width=True)
+
+    if not submitted:
+        return
+
+    row = pd.DataFrame([answers])[FEATURE_ORDER]
+    p_satisfied = float(model.predict_proba(row)[0][1])
+    satisfied = p_satisfied >= THRESHOLD
+
+    section("Result")
+    if satisfied:
+        st.markdown(
+            f'<div class="result ok"><h2>Likely satisfied</h2><p>Predicted probability of satisfaction is '
+            f'<b>{p_satisfied:.1%}</b>, at or above the threshold of {THRESHOLD:.2f}.</p></div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div class="result low"><h2>Likely not satisfied</h2><p>Predicted probability of satisfaction is '
+            f'<b>{p_satisfied:.1%}</b>, below the threshold of {THRESHOLD:.2f}. '
+            f'Facility conditions and staff conduct are worth reviewing.</p></div>',
+            unsafe_allow_html=True)
+
+    gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=p_satisfied * 100,
+        number={"suffix": "%", "valueformat": ".1f"},
+        title={"text": "Probability of satisfaction"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": GREEN if satisfied else AMBER, "thickness": 0.3},
+            "steps": [{"range": [0, THRESHOLD * 100], "color": "rgba(201,138,0,0.15)"},
+                      {"range": [THRESHOLD * 100, 100], "color": "rgba(46,139,87,0.15)"}],
+            "threshold": {"line": {"color": NAVY, "width": 4}, "thickness": 0.85, "value": THRESHOLD * 100},
+        },
+    ))
+    gauge.update_layout(height=300, margin=dict(l=30, r=30, t=60, b=10), paper_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(gauge, width="stretch")
+    st.caption(f"The dark line marks the decision threshold ({THRESHOLD:.0%}).")
+
+    with st.expander("Input summary"):
+        summary = pd.DataFrame({
+            "Question": [f.label for f in FEATURES],
+            "Answer": [next(k for k, v in f.options.items() if v == answers[f.code]) for f in FEATURES],
+        })
+        st.dataframe(summary, width="stretch", hide_index=True)
+    st.caption("Decision-support estimate for research and quality improvement. It is not a clinical diagnosis.")
+
+
+def page_performance(model) -> None:
+    hero("Model performance",
+         f"Evaluation on the held-out test set ({STUDY['n_test']} mothers, 20% of {STUDY['n_total']}).")
+
+    section(f"Performance at threshold {THRESHOLD:.2f}")
+    top = st.columns(4)
+    for col, name in zip(top, ["Accuracy", "Sensitivity", "Specificity", "Precision"]):
+        col.metric(name, f"{METRICS[name]:.1%}")
+    bottom = st.columns(4)
+    bottom[0].metric("F1 score", f"{METRICS['F1 score']:.1%}")
+    bottom[1].metric("AUC-ROC", f"{AUC_ROC:.3f}", help="Approximate value entered by hand; update from the notebook.")
+    bottom[2].metric("Brier score", f"{BRIER:.4f}", help="Lower is better (0 = perfect).")
+
+    section("Confusion matrix")
+    labels = ["Not satisfied", "Satisfied"]
+    matrix = go.Figure(go.Heatmap(
+        z=[[TN, FP], [FN, TP]],
+        x=[f"Predicted {l.lower()}" for l in labels],
+        y=[f"Actual {l.lower()}" for l in labels],
+        text=[[f"TN = {TN}", f"FP = {FP}"], [f"FN = {FN}", f"TP = {TP}"]],
+        texttemplate="<b>%{z}</b><br>%{text}", textfont={"size": 15},
+        colorscale="Blues", showscale=False,
+    ))
+    matrix.update_layout(height=330, margin=dict(l=10, r=10, t=10, b=10), yaxis={"autorange": "reversed"})
+    left, right = st.columns([1.2, 1])
+    left.plotly_chart(matrix, width="stretch")
+    right.markdown(
+        "| Term | Count | Meaning |\n|---|---|---|\n"
+        f"| TN | {TN} | Not satisfied, correctly identified |\n"
+        f"| FP | {FP} | Not satisfied, wrongly called satisfied |\n"
+        f"| FN | {FN} | Satisfied, wrongly called not satisfied |\n"
+        f"| TP | {TP} | Satisfied, correctly identified |")
+
+    section("Metrics across thresholds")
+    styles = {"Sensitivity": ("#2E8B57", "solid"), "Specificity": ("#C0392B", "solid"),
+              "F1 score": ("#3A6EA5", "dash"), "Accuracy": ("#7D4E9E", "dot"), "Youden J": ("#C98A00", "dashdot")}
+    lines = go.Figure()
+    for metric, (color, dash) in styles.items():
+        lines.add_trace(go.Scatter(x=THRESHOLD_TABLE["Threshold"], y=THRESHOLD_TABLE[metric], name=metric,
+                                   mode="lines+markers", line=dict(color=color, width=2.5, dash=dash)))
+    lines.add_vline(x=THRESHOLD, line_dash="dash", line_color=NAVY, line_width=2,
+                    annotation_text=f"Threshold {THRESHOLD:.2f}", annotation_position="top right")
+    lines.update_layout(xaxis_title="Threshold", yaxis_title="Score", yaxis_range=[0.3, 1.05],
+                        legend=dict(orientation="h", y=-0.25), height=420, hovermode="x unified",
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(lines, width="stretch")
+    with st.expander("Threshold table"):
+        st.dataframe(THRESHOLD_TABLE, width="stretch", hide_index=True,
+                     column_config={c: st.column_config.NumberColumn(format="%.3f")
+                                    for c in THRESHOLD_TABLE.columns if c != "Threshold"})
+
+    section("Odds ratios")
+    try:
+        table = odds_ratio_table(model)
+        table["Log distance"] = np.abs(np.log(table["Odds ratio"]))
+        table = table.nlargest(15, "Log distance").sort_values("Odds ratio")
+        table["Effect"] = np.where(table["Odds ratio"] >= 1, "Raises odds of satisfaction", "Lowers odds of satisfaction")
+        chart = px.bar(table, x="Odds ratio", y="Category", orientation="h", color="Effect",
+                       color_discrete_map={"Raises odds of satisfaction": GREEN, "Lowers odds of satisfaction": RED})
+        chart.add_vline(x=1.0, line_dash="dash", line_color="#888")
+        chart.update_layout(height=520, legend_title_text="", legend=dict(orientation="h", y=-0.15),
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(chart, width="stretch")
+        st.caption("The 15 strongest categories. Each odds ratio is relative to the first option of its question "
+                   "(for example Private for facility ownership). Above 1 raises the odds of satisfaction.")
+    except Exception as exc:
+        st.info(f"Odds ratios are not available for this model file: {exc}")
+
+
+def page_about(model) -> None:
+    hero("About this study",
+         "Maternal satisfaction among vaginal and caesarean section delivery care services in Bahir Dar City "
+         "Health Facilities, Northwest Ethiopia: application of machine learning.")
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.subheader("Study overview")
+        ns, s = STUDY["n_not_satisfied"], STUDY["n_satisfied"]
+        st.markdown(
+            f"- **Participants:** {STUDY['n_total']} mothers\n"
+            f"- **Outcome:** overall satisfaction with delivery care\n"
+            f"  - Not satisfied: {ns} ({ns / STUDY['n_total']:.1%})\n"
+            f"  - Satisfied: {s} ({s / STUDY['n_total']:.1%})\n"
+            "- **Train / test split:** 80% / 20%, stratified\n"
+            "- **Cross-validation:** 5-fold stratified")
+        st.subheader("Variable selection")
+        st.markdown(
+            "Excluded before modelling:\n\n"
+            "| Reason | Variables |\n|---|---|\n"
+            "| Satisfaction sub-items (data leakage) | 10 |\n"
+            "| More than 50% missing values | 2 |\n"
+            "| Recoded duplicates of kept variables | 6 |\n\n"
+            f"{STUDY['n_candidates']} candidate features remained. The final {len(FEATURES)} were chosen by "
+            "5-fold cross-validated permutation importance (ROC-AUC).")
+    with right:
+        st.subheader("Model configuration")
+        clf = model.named_steps["classifier"]
+        st.markdown(
+            "| Parameter | Value |\n|---|---|\n"
+            "| Algorithm | Logistic regression |\n"
+            f"| Regularisation C | {clf.C} |\n"
+            f"| Solver | {clf.solver} |\n"
+            f"| Class weight | {clf.class_weight} |\n"
+            f"| Max iterations | {clf.max_iter} |\n"
+            "| Tuning | GridSearchCV, ROC-AUC, 5 folds |")
+        st.subheader("Decision threshold")
+        best_j = THRESHOLD_TABLE.loc[THRESHOLD_TABLE["Youden J"].idxmax()]
+        best_f1 = THRESHOLD_TABLE.loc[THRESHOLD_TABLE["F1 score"].idxmax()]
+        default = THRESHOLD_TABLE.loc[THRESHOLD_TABLE["Threshold"] == 0.50].iloc[0]
+        st.markdown(
+            f"The threshold of **{THRESHOLD:.2f}** maximises Youden J (sensitivity + specificity − 1), "
+            "balancing the detection of satisfied and not-satisfied mothers.\n\n"
+            "| Rule | Threshold | Result |\n|---|---|---|\n"
+            f"| Best Youden J | {best_j['Threshold']:.2f} | J = {best_j['Youden J']:.3f} |\n"
+            f"| Best F1 (on this grid) | {best_f1['Threshold']:.2f} | F1 = {best_f1['F1 score']:.3f} |\n"
+            f"| Default | 0.50 | J = {default['Youden J']:.3f} |")
+
+    section(f"The {len(FEATURES)} model inputs")
+    cols = st.columns(2)
+    for i, feature in enumerate(FEATURES):
+        with cols[i % 2].container(border=True):
+            st.markdown(f"**{feature.label}**")
+            st.caption(feature.help)
+            st.caption("Options: " + ", ".join(feature.options))
+    st.caption("Notebook: Maternal_Satisfaction_ML_Project.ipynb · Dataset: Delivery care satisfaction.sav · "
+               "Credit: Getasew Mulat")
+
+
+# =============================================================================
+# App
+# =============================================================================
 with st.sidebar:
-    st.markdown("## 🤰 Maternal Satisfaction")
-    st.markdown("**Bahir Dar City Health Facilities**  \nNorthwest Ethiopia")
-    st.markdown("---")
+    st.markdown("### Maternal Satisfaction")
+    st.caption("Bahir Dar City Health Facilities, Northwest Ethiopia")
+    page = st.radio("Section", ["Predict", "Model performance", "About"], label_visibility="collapsed")
+    st.divider()
+    st.caption(f"Logistic regression · {len(FEATURES)} inputs · threshold {THRESHOLD:.2f}")
+    st.caption(f"Sensitivity {METRICS['Sensitivity']:.1%} · Specificity {METRICS['Specificity']:.1%}")
 
-    # Navigation
-    page = st.radio(
-        "Navigate",
-        ["🔮 Predict", "📊 Model Performance", "ℹ️ About"],
-        label_visibility="collapsed",
-    )
-
-    st.markdown("---")
-
-    # Model summary card
-    st.markdown("**Model Summary**")
-    st.markdown(
-        """
-        <div style='font-size:0.85em; line-height:1.8;'>
-        🧠 &nbsp;<b>Algorithm:</b> Logistic Regression<br>
-        📦 &nbsp;<b>Features:</b> 10<br>
-        📐 &nbsp;<b>Threshold:</b> 0.65 (Youden J)<br>
-        🎯 &nbsp;<b>F1 Score:</b> 88.2%<br>
-        ✅ &nbsp;<b>Accuracy:</b> 85.5%<br>
-        👁️ &nbsp;<b>Sensitivity:</b> 88.2%<br>
-        🛡️ &nbsp;<b>Specificity:</b> 81.2%<br>
-        📉 &nbsp;<b>Brier Score:</b> 0.1204
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("---")
-    st.caption(
-        "Built from `Maternal_Satisfaction_ML_Project.ipynb`  \n"
-        "Model: `Maternal_Satisfaction_LR_Final_Model.pkl`"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Guard model file
-# ─────────────────────────────────────────────────────────────────────────────
 if not MODEL_PATH.exists():
-    st.error(
-        f"**Model file not found:** `{MODEL_PATH.name}`\n\n"
-        "Run the notebook through **Step 12** (`joblib.dump(...)`) "
-        "to generate it, then place it in the same folder as `app.py`."
-    )
+    st.error(f"Model file not found: `{MODEL_PATH.name}`. Run the notebook through Step 12 and place the "
+             "file in the same folder as `app.py`.")
     st.stop()
 
 model = load_model(MODEL_PATH)
+check_model_inputs(model)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — PREDICT
-# ═════════════════════════════════════════════════════════════════════════════
-if page == "🔮 Predict":
-
-    # Hero banner
-    st.markdown("""
-    <div class="hero">
-        <h1>🤰 Maternal Satisfaction Predictor</h1>
-        <p>Predict whether a mother will be satisfied with delivery care services
-        using a Logistic Regression model trained on 894 mothers from
-        Bahir Dar City Health Facilities, Northwest Ethiopia.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Threshold info strip
-    col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-    col_t1.metric("Optimal Threshold", "0.65", help="Youden J statistic")
-    col_t2.metric("Sensitivity",  "88.2%")
-    col_t3.metric("Specificity",  "81.2%")
-    col_t4.metric("F1 Score",     "88.2%")
-
-    st.markdown("---")
-
-    # ── Input form ────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-title">Enter Mother\'s Details</div>',
-                unsafe_allow_html=True)
-    st.caption(
-        "Fill in all 10 fields. These are independent, non-satisfaction variables — "
-        "the 10 service-quality sub-items were excluded to prevent data leakage."
-    )
-
-    user_inputs: dict = {}
-    left_col, right_col = st.columns(2, gap="large")
-
-    for idx, feature in enumerate(FEATURE_ORDER):
-        meta        = FEATURE_META[feature]
-        target_col  = left_col if idx % 2 == 0 else right_col
-        with target_col:
-            chosen_label = st.selectbox(
-                label=f"{meta['icon']}  {meta['label']}",
-                options=list(meta["options"].keys()),
-                help=meta["help"],
-                key=feature,
-            )
-            user_inputs[feature] = meta["options"][chosen_label]
-
-    st.markdown("---")
-
-    # ── Predict button ────────────────────────────────────────────────────────
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 2, 1])
-    with btn_col2:
-        predict_clicked = st.button(
-            "▶  Predict Satisfaction",
-            type="primary",
-            use_container_width=True,
-        )
-
-    # ── Results ───────────────────────────────────────────────────────────────
-    if predict_clicked:
-        input_df     = pd.DataFrame([user_inputs])[FEATURE_ORDER]
-        proba        = model.predict_proba(input_df)[0]
-        prob_sat     = float(proba[1])
-        prob_not_sat = float(proba[0])
-        is_satisfied = prob_sat >= OPTIMAL_THRESHOLD
-
-        st.markdown("---")
-        st.markdown('<div class="section-title">Prediction Result</div>',
-                    unsafe_allow_html=True)
-
-        # Result banner
-        if is_satisfied:
-            st.markdown(f"""
-            <div class="result-satisfied">
-                <h2>😊 Satisfied</h2>
-                <p>The predicted probability of satisfaction is
-                <strong>{prob_sat*100:.1f}%</strong>, which is
-                above the optimal threshold of <strong>{OPTIMAL_THRESHOLD}</strong>.
-                This mother is likely to be <strong>satisfied</strong>
-                with the delivery care she received.</p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="result-not-satisfied">
-                <h2>😟 Not Satisfied</h2>
-                <p>The predicted probability of satisfaction is
-                <strong>{prob_sat*100:.1f}%</strong>, which is
-                below the optimal threshold of <strong>{OPTIMAL_THRESHOLD}</strong>.
-                This mother is likely to be <strong>not satisfied</strong>
-                with the delivery care. Consider reviewing facility
-                conditions and staff behaviour.</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-        # Probability gauge (Plotly)
-        fig_gauge = go.Figure(go.Indicator(
-            mode  = "gauge+number+delta",
-            value = prob_sat * 100,
-            delta = {"reference": OPTIMAL_THRESHOLD * 100,
-                     "valueformat": ".1f",
-                     "suffix": "%",
-                     "increasing": {"color": "#28a745"},
-                     "decreasing": {"color": "#dc3545"}},
-            number = {"suffix": "%", "font": {"size": 42}},
-            title  = {"text": "Probability of Satisfaction",
-                      "font": {"size": 18}},
-            gauge  = {
-                "axis":  {"range": [0, 100], "tickwidth": 1,
-                          "tickcolor": "#444"},
-                "bar":   {"color": "#28a745" if is_satisfied else "#ffc107",
-                          "thickness": 0.28},
-                "bgcolor": "white",
-                "borderwidth": 2,
-                "bordercolor": "#ddd",
-                "steps": [
-                    {"range": [0,  OPTIMAL_THRESHOLD*100], "color": "#fff0f0"},
-                    {"range": [OPTIMAL_THRESHOLD*100, 100], "color": "#f0fff4"},
-                ],
-                "threshold": {
-                    "line":  {"color": "#0f3460", "width": 5},
-                    "thickness": 0.85,
-                    "value": OPTIMAL_THRESHOLD * 100,
-                },
-            },
-        ))
-        fig_gauge.update_layout(
-            height=320, margin=dict(l=30, r=30, t=40, b=10),
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-        st.caption(
-            f"▲ The dark blue line marks the optimal threshold "
-            f"({OPTIMAL_THRESHOLD} = {OPTIMAL_THRESHOLD*100:.0f}%). "
-            f"The needle sits at your predicted probability ({prob_sat*100:.1f}%)."
-        )
-
-        # Probability bars comparison
-        fig_bar = go.Figure()
-        fig_bar.add_trace(go.Bar(
-            x=[prob_sat * 100, prob_not_sat * 100],
-            y=["Satisfied", "Not Satisfied"],
-            orientation="h",
-            marker_color=["#28a745", "#dc3545"],
-            text=[f"{prob_sat*100:.1f}%", f"{prob_not_sat*100:.1f}%"],
-            textposition="inside",
-            textfont=dict(color="white", size=15, family="Arial Black"),
-        ))
-        fig_bar.add_vline(
-            x=OPTIMAL_THRESHOLD * 100,
-            line_dash="dash", line_color="#0f3460", line_width=3,
-            annotation_text=f"Threshold {OPTIMAL_THRESHOLD}",
-            annotation_position="top",
-            annotation_font_color="#0f3460",
-        )
-        fig_bar.update_layout(
-            title=dict(text="Predicted Probabilities", font=dict(size=15)),
-            xaxis=dict(title="Probability (%)", range=[0, 105]),
-            yaxis=dict(tickfont=dict(size=13)),
-            height=200,
-            margin=dict(l=10, r=10, t=50, b=10),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            showlegend=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        # Input summary
-        with st.expander("📋  View input summary"):
-            summary_rows = []
-            for f in FEATURE_ORDER:
-                chosen = next(
-                    lbl for lbl, code in FEATURE_META[f]["options"].items()
-                    if code == user_inputs[f]
-                )
-                summary_rows.append({
-                    "Icon":      FEATURE_META[f]["icon"],
-                    "Feature":   FEATURE_META[f]["label"],
-                    "Answer":    chosen,
-                    "SPSS Code": user_inputs[f],
-                })
-            st.dataframe(
-                pd.DataFrame(summary_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — MODEL PERFORMANCE
-# ═════════════════════════════════════════════════════════════════════════════
-elif page == "📊 Model Performance":
-
-    st.markdown("""
-    <div class="hero">
-        <h1>📊 Model Performance</h1>
-        <p>Full evaluation of the Logistic Regression model on the
-        held-out test set (179 mothers = 20% of 894 total).</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Overall metrics ───────────────────────────────────────────────────────
-    st.markdown('<div class="section-title">Performance at Optimal Threshold (0.65)</div>',
-                unsafe_allow_html=True)
-
-    m_cols = st.columns(7)
-    metrics_display = [
-        ("Accuracy",     MODEL_PERF["Accuracy"],    "#0f3460",  None),
-        ("Precision",    MODEL_PERF["Precision"],   "#1a6b3a",  None),
-        ("Recall",       MODEL_PERF["Recall"],      "#1a6b3a",  None),
-        ("F1 Score",     MODEL_PERF["F1 Score"],    "#7b3f00",  None),
-        ("Sensitivity",  MODEL_PERF["Sensitivity"], "#6a0dad",  None),
-        ("Specificity",  MODEL_PERF["Specificity"], "#8b0000",  None),
-        ("Brier Score",  MODEL_PERF["Brier Score"], "#1a5276",  "lower is better"),
-    ]
-    for col, (name, val, color, note) in zip(m_cols, metrics_display):
-        # Brier score shown as raw value (not %), others as %
-        is_brier  = name == "Brier Score"
-        value_str = f"{val:.4f}" if is_brier else f"{val*100:.1f}%"
-        note_html = f"<div style='font-size:0.70em; color:#888; margin-top:2px;'>{note}</div>" if note else ""
-        col.markdown(
-            f"""<div style="text-align:center; background:#f8f9ff;
-                border:1px solid #dde; border-radius:12px; padding:18px 8px;">
-                <div style="font-size:0.75em; color:#666; font-weight:600;
-                            text-transform:uppercase; letter-spacing:0.5px;">
-                    {name}
-                </div>
-                <div style="font-size:1.8em; font-weight:800; color:{color};">
-                    {value_str}
-                </div>
-                {note_html}
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Confusion matrix ──────────────────────────────────────────────────────
-    st.markdown('<div class="section-title">Confusion Matrix  (threshold = 0.65)</div>',
-                unsafe_allow_html=True)
-
-    cm_vals = np.array([[56, 13], [13, 97]])   # TN FP / FN TP
-    cm_labels = ["Not Satisfied", "Satisfied"]
-
-    fig_cm = go.Figure(go.Heatmap(
-        z       = cm_vals,
-        x       = [f"Predicted<br>{l}" for l in cm_labels],
-        y       = [f"Actual<br>{l}"    for l in cm_labels],
-        colorscale = "Blues",
-        showscale  = False,
-        text    = [["TN = 56", "FP = 13"], ["FN = 13", "TP = 97"]],
-        texttemplate = "<b>%{z}</b><br><span style='font-size:11px'>%{text}</span>",
-        textfont     = {"size": 16},
-    ))
-    fig_cm.update_layout(
-        title  = dict(text="Confusion Matrix", font=dict(size=16)),
-        height = 340,
-        margin = dict(l=10, r=10, t=50, b=10),
-        xaxis  = dict(side="bottom"),
-    )
-
-    cm_col1, cm_col2 = st.columns([1.2, 1])
-    with cm_col1:
-        st.plotly_chart(fig_cm, use_container_width=True)
-    with cm_col2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown("""
-        | Term | Count | Meaning |
-        |---|---|---|
-        | **TN** | 56 | Not-satisfied correctly identified |
-        | **FP** | 13 | Not-satisfied wrongly called satisfied |
-        | **FN** | 13 | Satisfied wrongly called not-satisfied |
-        | **TP** | 97 | Satisfied correctly identified |
-        """)
-
-    # ── Threshold comparison chart ────────────────────────────────────────────
-    st.markdown('<div class="section-title">Threshold Analysis</div>',
-                unsafe_allow_html=True)
-
-    fig_thresh = go.Figure()
-    line_styles = {
-        "Sensitivity": ("#2ecc71", "solid"),
-        "Specificity": ("#e74c3c", "solid"),
-        "F1 Score":    ("#3498db", "dash"),
-        "Accuracy":    ("#9b59b6", "dot"),
-        "Youden J":    ("#f39c12", "dashdot"),
-    }
-    for metric, (color, dash) in line_styles.items():
-        fig_thresh.add_trace(go.Scatter(
-            x    = THRESHOLD_TABLE["Threshold"],
-            y    = THRESHOLD_TABLE[metric],
-            mode = "lines+markers",
-            name = metric,
-            line = dict(color=color, width=2.5, dash=dash),
-            marker = dict(size=7),
-        ))
-
-    fig_thresh.add_vline(
-        x=OPTIMAL_THRESHOLD,
-        line_dash="dash", line_color="#0f3460", line_width=3,
-        annotation_text=f"Optimal threshold = {OPTIMAL_THRESHOLD}",
-        annotation_position="top right",
-        annotation_font_color="#0f3460",
-        annotation_font_size=13,
-    )
-    fig_thresh.update_layout(
-        title   = dict(text="Metric vs Threshold", font=dict(size=16)),
-        xaxis   = dict(title="Threshold", dtick=0.05, gridcolor="#eee"),
-        yaxis   = dict(title="Score", range=[0.3, 1.05], gridcolor="#eee"),
-        legend  = dict(orientation="h", y=-0.25),
-        height  = 420,
-        hovermode = "x unified",
-        plot_bgcolor  = "rgba(0,0,0,0)",
-        paper_bgcolor = "rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig_thresh, use_container_width=True)
-
-    # Threshold data table
-    with st.expander("📋  View full threshold table"):
-        styled = THRESHOLD_TABLE.style \
-            .highlight_max(subset=["Youden J"], color="#c3f5d5") \
-            .format({c: "{:.3f}" for c in THRESHOLD_TABLE.columns if c != "Threshold"}) \
-            .format({"Threshold": "{:.2f}"})
-        st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # ── Feature importance bar ────────────────────────────────────────────────
-    st.markdown('<div class="section-title">Feature Importance</div>',
-                unsafe_allow_html=True)
-
-    # Approximate importance from model coefficients
-    try:
-        ohe  = model.named_steps["preprocessor"].named_transformers_["cat"]
-        coef = model.named_steps["classifier"].coef_[0]
-        feat_names_ohe = ohe.get_feature_names_out(FEATURE_ORDER)
-
-        imp_df = pd.DataFrame({
-            "Feature":    feat_names_ohe,
-            "Coefficient": coef,
-            "Odds Ratio":  np.exp(coef),
-        }).sort_values("Odds Ratio", ascending=True).reset_index(drop=True)
-
-        fig_imp = px.bar(
-            imp_df.tail(20),
-            x="Odds Ratio", y="Feature",
-            orientation="h",
-            color="Odds Ratio",
-            color_continuous_scale=["#e74c3c", "#f8f9ff", "#2ecc71"],
-            color_continuous_midpoint=1.0,
-            title="Odds Ratios (top 20 encoded features)",
-            labels={"Odds Ratio": "Odds Ratio  (>1 = increases satisfaction)"},
-        )
-        fig_imp.add_vline(x=1.0, line_dash="dash", line_color="#888",
-                          annotation_text="OR = 1  (no effect)",
-                          annotation_position="top")
-        fig_imp.update_layout(
-            height=520,
-            showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(fig_imp, use_container_width=True)
-        st.caption(
-            "Odds Ratio > 1 → factor increases odds of satisfaction.  "
-            "Odds Ratio < 1 → factor decreases odds of satisfaction."
-        )
-    except Exception as e:
-        st.info(f"Feature importance chart unavailable: {e}")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — ABOUT
-# ═════════════════════════════════════════════════════════════════════════════
-elif page == "ℹ️ About":
-
-    st.markdown("""
-    <div class="hero">
-        <h1>ℹ️ About This Study</h1>
-        <p>Maternal satisfaction among vaginal and caesarean section delivery
-        care services in Bahir Dar City Health Facilities, Northwest Ethiopia:
-        Application of Machine Learning.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_a, col_b = st.columns(2, gap="large")
-
-    with col_a:
-        st.markdown("### 📌 Study Overview")
-        st.markdown("""
-- **Dataset:** 894 mothers, Bahir Dar City, Ethiopia
-- **Outcome:** Overall delivery care satisfaction
-  - 0 = Not Satisfied (n = 345, 38.6%)
-  - 1 = Satisfied (n = 549, 61.4%)
-- **Algorithm:** Logistic Regression
-- **Train/Test split:** 80% / 20% (stratified)
-- **Cross-validation:** 5-fold Stratified K-Fold
-        """)
-
-        st.markdown("### 🔬 Feature Engineering")
-        st.markdown("""
-**Variables excluded before modeling:**
-
-| Reason | Count |
-|---|---|
-| 10 satisfaction sub-item recodes (data leakage) | 10 |
-| >50% missing values | 2 |
-| Recoded variables (originals kept) | 6 |
-| Target variable | 1 |
-
-**Clean candidate features remaining:** 27
-
-**Feature selection method:** 5-fold CV permutation importance (ROC-AUC)
-
-**Final features selected:** Top 10
-        """)
-
-    with col_b:
-        st.markdown("### 🎯 Model Configuration")
-        st.markdown("""
-| Parameter | Value |
-|---|---|
-| Algorithm | Logistic Regression |
-| Solver | lbfgs |
-| Best C (regularisation) | 0.1 |
-| class_weight | balanced |
-| max_iter | 1000 |
-| Tuning method | GridSearchCV |
-| Tuning metric | ROC-AUC |
-| CV folds | 5 (Stratified) |
-        """)
-
-        st.markdown("### 📐 Optimal Threshold")
-        st.markdown("""
-The decision threshold of **0.65** was selected using the
-**Youden J statistic**:
-
-> Youden J = Sensitivity + Specificity − 1
-
-This is maximised at 0.65, giving the best simultaneous balance
-between correctly identifying satisfied mothers (Sensitivity)
-and correctly identifying not-satisfied mothers (Specificity).
-
-| Method | Threshold | Key Metric |
-|---|---|---|
-| Youden J | **0.65** | J = 0.693 (best) |
-| Max F1 | 0.58 | F1 = 0.882 |
-| Default | 0.50 | J = 0.581 |
-
-**0.65 was chosen** because in maternal health, missing a
-dissatisfied mother (false negative) is as costly as
-misclassifying a satisfied one (false positive).
-        """)
-
-    st.markdown("---")
-    st.markdown("### 🏆 10 Selected Features")
-
-    feat_cols = st.columns(2)
-    for idx, feature in enumerate(FEATURE_ORDER):
-        meta = FEATURE_META[feature]
-        target_col = feat_cols[idx % 2]
-        target_col.markdown(
-            f"""<div class="feat-card">
-                <strong>{meta['icon']} {meta['label']}</strong><br>
-                <span style='font-size:0.82em; color:#666;'>
-                    {meta['help']}
-                </span><br>
-                <span style='font-size:0.78em; color:#999;'>
-                    Options: {", ".join(meta["options"].keys())}
-                </span>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("---")
-    st.caption(
-        "**Notebook:** Maternal_Satisfaction_ML_Project.ipynb  \n"
-        "**Model file:** Maternal_Satisfaction_LR_Final_Model.pkl  \n"
-        "**Dataset:** Delivery care satisfaction.sav (SPSS format) — "
-        "credit: Getasew Mulat"
-    )
+{"Predict": page_predict, "Model performance": page_performance, "About": page_about}[page](model)
